@@ -522,3 +522,217 @@ CFG_BATCH    = {**CFG, 'period_min_hr':0.01, 'period_max_hr':100.0, 'n_bootstrap
 CFG_STANDARD = {**CFG, 'period_min_hr':2.2,  'period_max_hr':100.0, 'n_bootstrap':0}
 CFG_SUPERFAST= {**CFG, 'period_min_hr':0.01, 'period_max_hr':2.2,   'n_bootstrap':0}
 print('AT-LAST v2.0.0 loaded.')
+
+# ══ v7 UPDATES — per-night normalisation + two-pass LS ══
+
+def assign_nights(t_hr, gap_threshold_hr=8.0):
+    t_sorted  = np.sort(t_hr)
+    sort_idx  = np.argsort(t_hr)
+    gaps      = np.diff(t_sorted)
+    new_night = np.concatenate([[0], (gaps > gap_threshold_hr).cumsum()])
+    nights    = np.empty(len(t_hr), dtype=int)
+    nights[sort_idx] = new_night
+    return nights
+
+def normalise_per_night(obj, gap_threshold_hr=8.0):
+    obj = obj.copy()
+    obj["night"] = assign_nights(obj["t_hr"].values, gap_threshold_hr)
+    global_median = obj["mag"].median()
+    for night in obj["night"].unique():
+        mask   = obj["night"] == night
+        offset = obj[mask]["mag"].median() - global_median
+        obj.loc[mask, "mag"] -= offset
+    return obj
+
+def assess_data_quality(obj):
+    n_obs    = len(obj)
+    nights   = obj["night"].values
+    n_nights = len(np.unique(nights))
+    night_starts = []
+    for n in np.unique(nights):
+        night_starts.append(obj["t_hr"][nights == n].min())
+    night_starts = np.sort(night_starts)
+    daily_alias = False
+    if len(night_starts) > 1:
+        gaps        = np.diff(night_starts)
+        daily_alias = bool(np.any((gaps > 22) & (gaps < 26)))
+    if n_nights >= 5 and n_obs >= 200 and not daily_alias:
+        grade, reason = "A", "Dense multi-night, low alias risk"
+    elif n_nights >= 4 and n_obs >= 100:
+        grade, reason = "B", "Good coverage"
+    elif n_nights >= 3 and not daily_alias:
+        grade, reason = "C", "Minimal coverage"
+    elif n_nights <= 2:
+        grade, reason = "D", "1-2 nights only"
+    else:
+        grade, reason = "C", "Daily alias risk"
+    return {"quality_grade": grade, "quality_reason": reason,
+            "n_nights": n_nights, "daily_alias_risk": daily_alias,
+            "t_span_hr": obj["t_hr"].max() - obj["t_hr"].min()}
+
+def run_lomb_scargle_twopass(obj_df, cfg):
+    t_arr    = obj_df["t_hr"].values
+    mag_arr  = obj_df["mag"].values
+    err_arr  = obj_df["rmsmag"].values
+    band_arr = obj_df["band"].values
+    n_obs    = len(obj_df)
+    t_span   = t_arr.max() - t_arr.min()
+
+    def run_ls(period_min, period_max):
+        p_max = min(period_max, t_span / 2.0)
+        p_min = period_min
+        if p_max <= p_min:
+            return None, None, None, np.array([]), np.array([])
+        f_min  = 1.0 / p_max
+        f_max  = 1.0 / p_min
+        n_freq = min(max(int(10 * f_max / f_min), 500), 50000)
+        freqs   = np.linspace(f_min, f_max, n_freq)
+        periods = 1.0 / freqs
+        model = LombScargleMultiband(Nterms_base=1, Nterms_band=1)
+        model.fit(t_arr, mag_arr, err_arr, band_arr)
+        scores = model.score(periods)
+        peak_idx = argrelextrema(scores, np.greater, order=5)[0]
+        if len(peak_idx) == 0:
+            peak_idx = np.array([np.argmax(scores)])
+        peak_idx = peak_idx[np.argsort(scores[peak_idx])[::-1]]
+        top_idx  = peak_idx[:cfg["n_top_periods"]]
+        return freqs, scores, periods, periods[top_idx], scores[top_idx]
+
+    freq1, sc1, per1, top_p1, top_s1 = run_ls(2.2,  100.0)
+    freq2, sc2, per2, top_p2, top_s2 = run_ls(0.01, 2.2)
+
+    s1 = float(top_s1[0]) if (freq1 is not None and len(top_s1) > 0) else 0.0
+    s2 = float(top_s2[0]) if (freq2 is not None and len(top_s2) > 0) else 0.0
+
+    if s1 == 0.0 and s2 == 0.0:
+        return None, None, None, np.array([]), np.array([]), 0.0
+    elif s1 >= s2:
+        return freq1, sc1, per1, top_p1, top_s1, s1
+    else:
+        return freq2, sc2, per2, top_p2, top_s2, s2
+
+def process_object_v7(df, provid, cfg):
+    result = {
+        "provid": provid, "status": "FAIL",
+        "period_hr": None, "period_flag": None,
+        "fourier_order": None, "bic": None, "ls_score": None,
+        "boot_fraction": None, "n_obs_used": None,
+        "n_bands": None, "n_nights": None, "mag_range": None,
+        "extrema_observed": None, "extrema_expected": None,
+        "extrema_pass": None, "alias_tested": None,
+        "quality_grade": None, "quality_reason": None,
+    }
+    try:
+        obj = get_object_data(df, provid)
+        if len(obj) < cfg["min_obs"]:
+            result["status"] = "INSUFFICIENT_OBS"
+            return result
+        obj, _ = normalise_multiband(obj, cfg["ref_band"])
+        obj    = normalise_per_night(obj)
+        n_obs    = len(obj)
+        n_nights = obj["night"].nunique()
+        result["n_obs_used"] = n_obs
+        result["n_bands"]    = obj["band"].nunique()
+        result["n_nights"]   = n_nights
+        result["mag_range"]  = float(np.ptp(obj["mag"].values))
+        qa = assess_data_quality(obj)
+        result["quality_grade"]  = qa["quality_grade"]
+        result["quality_reason"] = qa["quality_reason"]
+        freq, scores, periods, top_periods, top_scores, score_max = \
+            run_lomb_scargle_twopass(obj, cfg)
+        if freq is None or len(top_periods) == 0:
+            result["status"] = "NO_PERIOD_DETECTED"
+            return result
+        threshold          = get_score_threshold(n_obs)
+        result["ls_score"] = float(score_max)
+        if score_max < threshold:
+            result["status"] = "NO_PERIOD_DETECTED"
+            return result
+        t   = obj["t_hr"].values
+        mag = obj["mag"].values
+        err = obj["rmsmag"].values
+        best_period = top_periods[0]
+        fourier     = fit_fourier(t, mag, err, best_period,
+                                  cfg["max_fourier_order"])
+        if not fourier:
+            result["status"] = "FOURIER_FIT_FAILED"
+            return result
+        obs_extrema = count_extrema(t, mag, err, best_period,
+                                    fourier["order"])
+        exp_extrema = expected_extrema(fourier["order"])
+        period_final, fourier_final, alias_tested, extrema_ok = \
+            resolve_period(t, mag, err, best_period, top_periods,
+                           fourier, obs_extrema, exp_extrema, cfg)
+        obs_ext_final = count_extrema(t, mag, err, period_final,
+                                      fourier_final["order"])
+        exp_ext_final = expected_extrema(fourier_final["order"])
+        boot_frac = bootstrap_period(t, mag, err, period_final, cfg)
+        if boot_frac is None:   flag = "UNVERIFIED"
+        elif boot_frac >= cfg["boot_min_fraction"]: flag = "RELIABLE"
+        elif boot_frac >= 0.3:  flag = "TENTATIVE"
+        else:                   flag = "UNRELIABLE"
+        result.update({
+            "status": "OK", "period_hr": float(period_final),
+            "period_flag": flag, "fourier_order": fourier_final["order"],
+            "bic": float(fourier_final["bic"]),
+            "ls_score": float(score_max),
+            "boot_fraction": boot_frac, "alias_tested": alias_tested,
+            "extrema_observed": obs_ext_final,
+            "extrema_expected": exp_ext_final,
+            "extrema_pass": extrema_ok,
+        })
+    except Exception as e:
+        result["status"] = f"ERROR: {str(e)[:80]}"
+    return result
+
+def run_batch_v7(df_all, provid_list, cfg, results_path,
+                 checkpoint_path, checkpoint_every=500):
+    import time
+    if os.path.exists(checkpoint_path):
+        df_done      = pd.read_csv(checkpoint_path)
+        done_provids = set(df_done["provid"].tolist())
+        results      = df_done.to_dict("records")
+        print(f"Resuming: {len(done_provids):,} done, "
+              f"{len(provid_list)-len(done_provids):,} remaining")
+    else:
+        done_provids = set()
+        results      = []
+    todo    = [p for p in provid_list if p not in done_provids]
+    t_start = time.time()
+    for i, provid in enumerate(todo):
+        r     = process_object_v7(df_all, provid, cfg)
+        match, matched_p = is_match(provid, r["period_hr"])
+        results.append({
+            "provid": provid, "period_hr": r["period_hr"],
+            "period_flag": r["period_flag"], "ls_score": r["ls_score"],
+            "fourier_order": r["fourier_order"], "bic": r["bic"],
+            "status": r["status"], "n_obs": r["n_obs_used"],
+            "n_bands": r["n_bands"], "n_nights": r["n_nights"],
+            "mag_range": r["mag_range"],
+            "quality_grade": r["quality_grade"],
+            "quality_reason": r["quality_reason"],
+            "extrema_pass": r["extrema_pass"],
+            "alias_tested": r["alias_tested"],
+            "validated_match": match, "matched_period": matched_p,
+        })
+        if (i + 1) % checkpoint_every == 0:
+            df_check = pd.DataFrame(results)
+            df_check.to_csv(checkpoint_path, index=False)
+            elapsed = time.time() - t_start
+            rate    = (i + 1) / elapsed
+            eta_hr  = (len(todo) - i - 1) / rate / 3600
+            pct_ok  = (df_check["status"] == "OK").mean() * 100
+            print(f"  [{i+1:>6,}/{len(todo):,}]  "
+                  f"elapsed={elapsed/3600:.2f}hr  "
+                  f"eta={eta_hr:.1f}hr  ok={pct_ok:.1f}%")
+    df_results = pd.DataFrame(results)
+    df_results.to_csv(results_path, index=False)
+    df_results.to_csv(checkpoint_path, index=False)
+    total = time.time() - t_start
+    ok    = df_results[df_results["status"] == "OK"]
+    print(f"\nBATCH COMPLETE: {len(df_results):,} objects  "
+          f"OK={len(ok):,} ({100*len(ok)/len(df_results):.1f}%)  "
+          f"Time={total/3600:.2f}hr")
+    return df_results
+
+print("v7 functions written.")
