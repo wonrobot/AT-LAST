@@ -736,3 +736,291 @@ def run_batch_v7(df_all, provid_list, cfg, results_path,
     return df_results
 
 print("v7 functions written.")
+
+
+# ════════════════════════════════════════════════════════════════════
+# FINAL PIPELINE FUNCTIONS — v2.1.0
+# Replaces run_lomb_scargle_twopass and old resolve_period
+# ════════════════════════════════════════════════════════════════════
+
+def run_lomb_scargle_final(obj_df, cfg):
+    """
+    Two-pass multiband Lomb-Scargle period search.
+
+    Pass 1: Standard range 2.2-100hr, oversample=10
+            Justified by VanderPlas & Ivezic 2015 (gatspy paper)
+    Pass 2: Superfast range 0.01-2.2hr, oversample=100
+            Justified by Greenstreet et al. 2026 (same dataset)
+    Split at 2.2hr: physical spin barrier (Carbognani 2017)
+
+    Frequency grid: n = (f_max - f_min) x T x oversample
+    Data-adaptive: scales with observation arc T (days).
+    Peak width ~ 1/T, oversample sets points-per-peak.
+
+    Always runs both passes, returns higher-scoring result.
+    No early exit — avoids overfitting to validation set.
+    """
+    from scipy.signal import argrelextrema
+    t_arr    = obj_df["t_hr"].values
+    mag_arr  = obj_df["mag"].values
+    err_arr  = obj_df["rmsmag"].values
+    band_arr = obj_df["band"].values
+    t_span   = t_arr.max() - t_arr.min()
+    t_days   = t_span / 24.0
+
+    def run_ls(period_min, period_max, oversample):
+        p_max = min(period_max, t_span / 2.0)
+        p_min = period_min
+        if p_max <= p_min:
+            return None, None, None, np.array([]), np.array([])
+        f_min  = 1.0 / p_max
+        f_max  = 1.0 / p_min
+        n_freq = int((f_max - f_min) * t_days * oversample)
+        n_freq = max(n_freq, 100)
+        n_freq = min(n_freq, 500000)
+        freqs   = np.linspace(f_min, f_max, n_freq)
+        periods = 1.0 / freqs
+        model = LombScargleMultiband(Nterms_base=1, Nterms_band=1)
+        model.fit(t_arr, mag_arr, err_arr, band_arr)
+        scores = model.score(periods)
+        peak_idx = argrelextrema(scores, np.greater, order=5)[0]
+        if len(peak_idx) == 0:
+            peak_idx = np.array([np.argmax(scores)])
+        peak_idx = peak_idx[np.argsort(scores[peak_idx])[::-1]]
+        top_idx  = peak_idx[:cfg["n_top_periods"]]
+        return freqs, scores, periods, periods[top_idx], scores[top_idx]
+
+    freq1, sc1, per1, top_p1, top_s1 = run_ls(2.2,  100.0, oversample=10)
+    freq2, sc2, per2, top_p2, top_s2 = run_ls(0.01, 2.2,   oversample=100)
+
+    s1 = float(top_s1[0]) if (freq1 is not None and len(top_s1) > 0) else 0.0
+    s2 = float(top_s2[0]) if (freq2 is not None and len(top_s2) > 0) else 0.0
+
+    if s1 == 0.0 and s2 == 0.0:
+        return None, None, None, np.array([]), np.array([]), 0.0
+    elif s1 >= s2:
+        return freq1, sc1, per1, top_p1, top_s1, s1
+    else:
+        return freq2, sc2, per2, top_p2, top_s2, s2
+
+
+def get_independent_peaks(top_periods, top_scores,
+                           min_separation=0.10,
+                           harmonic_ratios=[0.5, 2.0, 1/3, 3.0]):
+    """
+    Filter top LS peaks to keep only independent period families.
+    Removes peaks that are harmonics of already-kept peaks.
+
+    Ensures resolve_period tests genuinely different period families,
+    not redundant harmonics of the same base signal.
+    """
+    kept_periods = [top_periods[0]]
+    kept_scores  = [top_scores[0]]
+
+    for p, s in zip(top_periods[1:], top_scores[1:]):
+        is_harmonic = False
+        for kept_p in kept_periods:
+            ratio = p / kept_p
+            if any(abs(ratio - h) / h < min_separation
+                   for h in harmonic_ratios):
+                is_harmonic = True
+                break
+            if abs(p - kept_p) / kept_p < min_separation:
+                is_harmonic = True
+                break
+        if not is_harmonic:
+            kept_periods.append(p)
+            kept_scores.append(s)
+
+    return np.array(kept_periods), np.array(kept_scores)
+
+
+def resolve_period(t, mag, err, best_period, top_periods,
+                   fourier, obs_extrema, exp_extrema, cfg):
+    """
+    Alias resolution — extrema improvement required, no fallback.
+
+    Tier 1 (base passes extrema): keep base period unchanged.
+    Tier 2 (base fails extrema): find alternative with BOTH:
+      - Strictly fewer excess extrema than base
+      - Better BIC than base
+    If nothing qualifies: keep base period (no blind fallback).
+
+    alias_ratios = [2.0, 0.5] only — P/2 and 2P are the physically
+    motivated aliases for 2-maxima asteroid light curves.
+    3P and P/3 removed — caused false positives in validation.
+
+    Independent peaks from get_independent_peaks should be passed
+    as top_periods to avoid testing redundant harmonics.
+    """
+    base_extrema_ok = (
+        abs(obs_extrema - exp_extrema) <= cfg["extrema_tolerance"])
+    base_excess = abs(obs_extrema - exp_extrema)
+
+    if base_extrema_ok:
+        return best_period, fourier, "none", True
+
+    best_bic     = fourier["bic"]
+    period_final = best_period
+    best_fourier = fourier
+    alias_tested = "none"
+    extrema_ok   = False
+    best_excess  = base_excess
+
+    candidates = []
+    for ratio in cfg["alias_ratios"]:
+        alias_p = best_period * ratio
+        if cfg["period_min_hr"] < alias_p < cfg["period_max_hr"]:
+            candidates.append((alias_p, f"x{ratio:.1f}"))
+    for p in top_periods[1:]:
+        candidates.append((p, "alt_peak"))
+
+    for cand_p, label in candidates:
+        f = fit_fourier(t, mag, err, cand_p, cfg["max_fourier_order"])
+        if not f:
+            continue
+        e      = count_extrema(t, mag, err, cand_p, f["order"])
+        e_exp  = expected_extrema(f["order"])
+        excess = abs(e - e_exp)
+
+        if excess < best_excess and f["bic"] < best_bic:
+            best_bic     = f["bic"]
+            period_final = cand_p
+            best_fourier = f
+            alias_tested = label
+            extrema_ok   = excess <= cfg["extrema_tolerance"]
+            best_excess  = excess
+
+    return period_final, best_fourier, alias_tested, extrema_ok
+
+
+def process_object_final(df, provid, cfg):
+    """
+    Final AT-LAST pipeline — v2.1.0
+
+    Steps:
+    1.  Load + clean photometry (rmsmag <= 0.3)
+    2.  Per-band normalisation (subtract band median offset)
+    3.  Per-night normalisation (removes 24hr daily alias)
+    4.  Data quality assessment (grade A/B/C/D)
+    5.  Two-pass multiband LS (run_lomb_scargle_final):
+        Pass 1: 2.2-100hr, oversample=10
+        Pass 2: 0.01-2.2hr, oversample=100
+    6.  Dynamic score threshold (0.25-0.50 based on n_obs)
+    7.  Fourier model fitting (orders 1-5, BIC selection)
+    8.  Extrema gate (soft check on light curve shape)
+    9.  Independent peak deduplication (get_independent_peaks)
+    10. Alias resolution (resolve_period — extrema improvement)
+    11. Bootstrap stability (n=0 for batch → UNVERIFIED flag)
+    12. Flag: RELIABLE/TENTATIVE/UNRELIABLE/UNVERIFIED
+
+    Validation: 52/75 (69.3%) match vs Greenstreet et al. 2026
+    Standard: 39/58 (67.2%)  Superfast: 13/17 (76.5%)
+    """
+    result = {
+        "provid"          : provid,
+        "status"          : "FAIL",
+        "period_hr"       : None,
+        "period_flag"     : None,
+        "fourier_order"   : None,
+        "bic"             : None,
+        "ls_score"        : None,
+        "boot_fraction"   : None,
+        "n_obs_used"      : None,
+        "n_bands"         : None,
+        "n_nights"        : None,
+        "mag_range"       : None,
+        "extrema_observed": None,
+        "extrema_expected": None,
+        "extrema_pass"    : None,
+        "alias_tested"    : None,
+        "quality_grade"   : None,
+        "quality_reason"  : None,
+    }
+    try:
+        obj = get_object_data(df, provid)
+        if len(obj) < cfg["min_obs"]:
+            result["status"] = "INSUFFICIENT_OBS"
+            return result
+
+        obj, _ = normalise_multiband(obj, cfg["ref_band"])
+        obj    = normalise_per_night(obj)
+
+        n_obs    = len(obj)
+        n_nights = obj["night"].nunique()
+        result["n_obs_used"] = n_obs
+        result["n_bands"]    = obj["band"].nunique()
+        result["n_nights"]   = n_nights
+        result["mag_range"]  = float(np.ptp(obj["mag"].values))
+
+        qa = assess_data_quality(obj)
+        result["quality_grade"]  = qa["quality_grade"]
+        result["quality_reason"] = qa["quality_reason"]
+
+        freq, scores, periods, top_periods, top_scores, score_max =             run_lomb_scargle_final(obj, cfg)
+
+        if freq is None or len(top_periods) == 0:
+            result["status"] = "NO_PERIOD_DETECTED"
+            return result
+
+        threshold          = get_score_threshold(n_obs)
+        result["ls_score"] = float(score_max)
+
+        if score_max < threshold:
+            result["status"] = "NO_PERIOD_DETECTED"
+            return result
+
+        t   = obj["t_hr"].values
+        mag = obj["mag"].values
+        err = obj["rmsmag"].values
+
+        best_period = top_periods[0]
+        fourier     = fit_fourier(t, mag, err, best_period,
+                                  cfg["max_fourier_order"])
+        if not fourier:
+            result["status"] = "FOURIER_FIT_FAILED"
+            return result
+
+        obs_extrema = count_extrema(t, mag, err, best_period,
+                                    fourier["order"])
+        exp_extrema = expected_extrema(fourier["order"])
+
+        top_periods_indep, _ = get_independent_peaks(
+            top_periods, top_scores)
+
+        period_final, fourier_final, alias_tested, extrema_ok =             resolve_period(t, mag, err, best_period, top_periods_indep,
+                           fourier, obs_extrema, exp_extrema, cfg)
+
+        obs_ext_final = count_extrema(t, mag, err, period_final,
+                                      fourier_final["order"])
+        exp_ext_final = expected_extrema(fourier_final["order"])
+
+        boot_frac = bootstrap_period(t, mag, err, period_final, cfg)
+
+        if boot_frac is None:
+            flag = "UNVERIFIED"
+        elif boot_frac >= cfg["boot_min_fraction"]:
+            flag = "RELIABLE"
+        elif boot_frac >= 0.3:
+            flag = "TENTATIVE"
+        else:
+            flag = "UNRELIABLE"
+
+        result.update({
+            "status"          : "OK",
+            "period_hr"       : float(period_final),
+            "period_flag"     : flag,
+            "fourier_order"   : fourier_final["order"],
+            "bic"             : float(fourier_final["bic"]),
+            "ls_score"        : float(score_max),
+            "boot_fraction"   : boot_frac,
+            "alias_tested"    : alias_tested,
+            "extrema_observed": obs_ext_final,
+            "extrema_expected": exp_ext_final,
+            "extrema_pass"    : extrema_ok,
+        })
+
+    except Exception as e:
+        result["status"] = f"ERROR: {str(e)[:80]}"
+
+    return result
